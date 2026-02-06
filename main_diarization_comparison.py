@@ -14,8 +14,11 @@ Usage:
     # Analyze single audio file with all methods:
     python3 main_diarization_comparison.py audio.wav
     
-    # Analyze folder with all methods:
+    # Analyze folder with all methods (non-recursive):
     python3 main_diarization_comparison.py /path/to/audio/folder
+    
+    # Analyze all subfolders recursively (each subfolder processed separately):
+    python3 main_diarization_comparison.py /path/to/parent/folder --recursive
     
     # Analyze with specific methods only:
     python3 main_diarization_comparison.py audio.wav --methods energy webrtc
@@ -30,7 +33,7 @@ import logging
 import numpy as np
 import soundfile as sf
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import torchaudio
 from pathlib import Path
 import warnings
@@ -461,14 +464,26 @@ def generate_diarization_silero(audio_file_path: str,
 
 def find_audio_files(folder_path: Path) -> List[Path]:
     """
-    Find all audio files in the given folder
+    Find all audio files in the given folder (non-recursive)
     """
     audio_files = []
-    for root, _, files in os.walk(folder_path):
-        for file in files:
-            if file.lower().endswith(('.wav', '.mp3', '.m4a', '.flac', '.aac', '.ogg', '.wma', '.aiff', '.au')):
-                audio_files.append(Path(root) / file)
-    return audio_files
+    if folder_path.is_dir():
+        for file in folder_path.iterdir():
+            if file.is_file() and file.suffix.lower() in ['.wav', '.mp3', '.m4a', '.flac', '.aac', '.ogg', '.wma', '.aiff', '.au']:
+                audio_files.append(file)
+    return sorted(audio_files)
+
+
+def find_subfolders(parent_path: Path) -> List[Path]:
+    """
+    Find all immediate subfolders in the given parent folder
+    """
+    subfolders = []
+    if parent_path.is_dir():
+        for item in parent_path.iterdir():
+            if item.is_dir():
+                subfolders.append(item)
+    return sorted(subfolders)
 
 
 def convert_numpy_types(obj):
@@ -509,81 +524,36 @@ def print_diarization_summary(result: Dict[str, Any]):
     print(f"    Avg silence: {metrics.get('avg_silence_percentage', 0):.1f}%")
 
 
-def main():
+def process_folder(folder_path: Path, methods_to_use: List[str], verbose: bool) -> Tuple[int, int, Dict[str, Dict[str, int]]]:
     """
-    Main function to perform multi-method diarization comparison.
+    Process all audio files in a single folder with all selected methods.
+    
+    Returns:
+        Tuple of (processed_count, error_count, method_stats)
     """
-    parser = argparse.ArgumentParser(
-        description="Compare multiple diarization methods on audio files"
-    )
-    parser.add_argument("input_path", type=str, 
-                       help="Path to audio file or folder containing audio files")
-    parser.add_argument("--methods", nargs='+', 
-                       choices=['energy', 'spectral', 'webrtc', 'silero', 'all'],
-                       default=['all'],
-                       help="Methods to use (default: all)")
-    parser.add_argument("--verbose", action="store_true",
-                       help="Enable verbose logging")
+    audio_files = find_audio_files(folder_path)
     
-    args = parser.parse_args()
+    if not audio_files:
+        print(f"  No audio files found in {folder_path.name}")
+        return 0, 0, {method: {'success': 0, 'error': 0} for method in methods_to_use}
     
-    # Set logging level
-    if args.verbose:
-        logging.basicConfig(level=logging.DEBUG)
+    print(f"  Found {len(audio_files)} audio file(s)")
     
-    # Determine which methods to use
-    if 'all' in args.methods:
-        methods_to_use = ['energy', 'spectral', 'webrtc', 'silero']
-    else:
-        methods_to_use = args.methods
-    
-    # Validate input path
-    input_path = Path(args.input_path)
-    if not input_path.exists():
-        print(f"Error: Path not found at {input_path.absolute()}")
-        return
-    
-    # Determine if input is file or folder
-    if input_path.is_file():
-        audio_files = [input_path]
-        print(f"\n{'='*80}")
-        print(f"MULTI-METHOD DIARIZATION COMPARISON - SINGLE FILE")
-        print(f"Target File: {input_path.absolute()}")
-        print(f"Methods: {', '.join(methods_to_use)}")
-        print(f"{'='*80}")
-    elif input_path.is_dir():
-        print(f"\n{'='*80}")
-        print(f"MULTI-METHOD DIARIZATION COMPARISON - FOLDER MODE")
-        print(f"Target Folder: {input_path.absolute()}")
-        print(f"Methods: {', '.join(methods_to_use)}")
-        print(f"{'='*80}")
-        
-        audio_files = find_audio_files(input_path)
-        if not audio_files:
-            print(f"No audio files found in {input_path}")
-            return
-        
-        print(f"Found {len(audio_files)} audio files")
-    else:
-        print(f"Error: {input_path.absolute()} is not a valid file or directory")
-        return
-    
-    # Process each audio file
     processed_count = 0
     error_count = 0
     method_stats = {method: {'success': 0, 'error': 0} for method in methods_to_use}
     
     for i, audio_file in enumerate(audio_files, 1):
-        print(f"\n[{i}/{len(audio_files)}] Processing: {audio_file.name}")
+        print(f"\n  [{i}/{len(audio_files)}] Processing: {audio_file.name}")
         
         try:
             # Get audio metadata
             info = sf.info(str(audio_file))
-            print(f"  Channels: {info.channels}, Sample Rate: {info.samplerate} Hz, Duration: {info.duration:.2f}s")
+            print(f"    Channels: {info.channels}, Sample Rate: {info.samplerate} Hz, Duration: {info.duration:.2f}s")
             
             # Process with each selected method
             for method in methods_to_use:
-                print(f"\n  [{method.upper()}] Running diarization...")
+                print(f"\n    [{method.upper()}] Running diarization...")
                 
                 try:
                     # Generate diarization based on method
@@ -617,7 +587,7 @@ def main():
                     with open(output_json_path, 'w', encoding='utf-8') as f:
                         json.dump(result, f, indent=2, ensure_ascii=False)
                     
-                    print(f"    ✓ Saved: {output_json_path.name}")
+                    print(f"      ✓ Saved: {output_json_path.name}")
                     
                     # Print summary
                     print_diarization_summary(result)
@@ -629,8 +599,8 @@ def main():
                         method_stats[method]['success'] += 1
                     
                 except Exception as e:
-                    print(f"    ✗ Error in {method}: {e}")
-                    if args.verbose:
+                    print(f"      ✗ Error in {method}: {e}")
+                    if verbose:
                         import traceback
                         traceback.print_exc()
                     method_stats[method]['error'] += 1
@@ -638,19 +608,133 @@ def main():
             processed_count += 1
             
         except Exception as e:
-            print(f"  ✗ Error processing {audio_file.name}: {e}")
-            if args.verbose:
+            print(f"    ✗ Error processing {audio_file.name}: {e}")
+            if verbose:
                 import traceback
                 traceback.print_exc()
             error_count += 1
+    
+    return processed_count, error_count, method_stats
+
+
+def main():
+    """
+    Main function to perform multi-method diarization comparison.
+    """
+    parser = argparse.ArgumentParser(
+        description="Compare multiple diarization methods on audio files"
+    )
+    parser.add_argument("input_path", type=str, 
+                       help="Path to audio file or folder containing audio files/subfolders")
+    parser.add_argument("--methods", nargs='+', 
+                       choices=['energy', 'spectral', 'webrtc', 'silero', 'all'],
+                       default=['all'],
+                       help="Methods to use (default: all)")
+    parser.add_argument("--recursive", action="store_true",
+                       help="Process each subfolder separately (creates diarization files in each subfolder)")
+    parser.add_argument("--verbose", action="store_true",
+                       help="Enable verbose logging")
+    
+    args = parser.parse_args()
+    
+    # Set logging level
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+    
+    # Determine which methods to use
+    if 'all' in args.methods:
+        methods_to_use = ['energy', 'spectral', 'webrtc', 'silero']
+    else:
+        methods_to_use = args.methods
+    
+    # Validate input path
+    input_path = Path(args.input_path)
+    if not input_path.exists():
+        print(f"Error: Path not found at {input_path.absolute()}")
+        return
+    
+    # Single file mode
+    if input_path.is_file():
+        print(f"\n{'='*80}")
+        print(f"MULTI-METHOD DIARIZATION COMPARISON - SINGLE FILE")
+        print(f"Target File: {input_path.absolute()}")
+        print(f"Methods: {', '.join(methods_to_use)}")
+        print(f"{'='*80}")
+        
+        # Process single file
+        folder_path = input_path.parent
+        audio_files = [input_path]
+        
+        processed_count, error_count, method_stats = process_folder(folder_path, methods_to_use, args.verbose)
+        
+    # Folder mode
+    elif input_path.is_dir():
+        # Recursive subfolder mode
+        if args.recursive:
+            print(f"\n{'='*80}")
+            print(f"MULTI-METHOD DIARIZATION COMPARISON - RECURSIVE SUBFOLDER MODE")
+            print(f"Parent Folder: {input_path.absolute()}")
+            print(f"Methods: {', '.join(methods_to_use)}")
+            print(f"{'='*80}")
+            
+            # Find all subfolders
+            subfolders = find_subfolders(input_path)
+            
+            if not subfolders:
+                print(f"\nNo subfolders found in {input_path}")
+                print(f"Tip: Use without --recursive to process files directly in this folder")
+                return
+            
+            print(f"\nFound {len(subfolders)} subfolder(s) to process")
+            
+            # Process each subfolder
+            total_processed = 0
+            total_errors = 0
+            global_method_stats = {method: {'success': 0, 'error': 0} for method in methods_to_use}
+            
+            for idx, subfolder in enumerate(subfolders, 1):
+                print(f"\n{'='*80}")
+                print(f"[SUBFOLDER {idx}/{len(subfolders)}] Processing: {subfolder.name}")
+                print(f"{'='*80}")
+                
+                processed, errors, method_stats = process_folder(subfolder, methods_to_use, args.verbose)
+                
+                total_processed += processed
+                total_errors += errors
+                
+                # Aggregate method stats
+                for method in methods_to_use:
+                    global_method_stats[method]['success'] += method_stats[method]['success']
+                    global_method_stats[method]['error'] += method_stats[method]['error']
+                
+                print(f"\n  Subfolder Summary:")
+                print(f"    Files processed: {processed}")
+                print(f"    Errors: {errors}")
+            
+            processed_count = total_processed
+            error_count = total_errors
+            method_stats = global_method_stats
+            
+        # Non-recursive folder mode
+        else:
+            print(f"\n{'='*80}")
+            print(f"MULTI-METHOD DIARIZATION COMPARISON - FOLDER MODE")
+            print(f"Target Folder: {input_path.absolute()}")
+            print(f"Methods: {', '.join(methods_to_use)}")
+            print(f"{'='*80}")
+            
+            processed_count, error_count, method_stats = process_folder(input_path, methods_to_use, args.verbose)
+    
+    else:
+        print(f"Error: {input_path.absolute()} is not a valid file or directory")
+        return
     
     # Print final summary
     print(f"\n{'='*80}")
     print("DIARIZATION COMPARISON SUMMARY")
     print(f"{'='*80}")
-    print(f"Total audio files found: {len(audio_files)}")
-    print(f"Successfully processed: {processed_count}")
-    print(f"Errors encountered: {error_count}")
+    print(f"Total files processed: {processed_count}")
+    print(f"Total errors encountered: {error_count}")
     print(f"\nMethod Statistics:")
     
     for method in methods_to_use:
