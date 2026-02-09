@@ -286,6 +286,9 @@ class MultichannelTranscriptGenerator:
                 if result:
                     transcribed_segments.append(result)
         
+        # Sort all segments by start time, then end time
+        transcribed_segments.sort(key=lambda x: (x["start"], x["end"]))
+        
         return {
             "transcription_mode": "custom_diarization",
             "primary_language": detected_language,
@@ -371,8 +374,8 @@ class MultichannelTranscriptGenerator:
                 logger.error(f"Error transcribing channel {ch_idx} with Whisper native: {e}")
                 continue
         
-        # Sort all segments by start time
-        all_transcribed_segments.sort(key=lambda x: x["start"])
+        # Sort all segments by start time, then end time
+        all_transcribed_segments.sort(key=lambda x: (x["start"], x["end"]))
         
         # Determine primary language (most common)
         primary_language = max(detected_languages, key=lambda lang: 
