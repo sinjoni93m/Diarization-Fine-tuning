@@ -2,8 +2,12 @@
 Transcript Generator Helper Functions Module
 
 Supports TWO transcript generation modes:
-1. Custom Diarization Mode: Uses external diarization results (from our 4 methods)
-2. Whisper Native Mode: Uses Whisper's built-in speaker diarization
+1. Whisper Native Mode: Uses Whisper's built-in speaker diarization — also detects language
+2. Custom Diarization Mode: Uses external diarization results (WebRTC, Silero)
+   and receives language hint from Whisper native detection
+
+Language detection flow:
+  Whisper Native runs first → detects language → language passed as hint to diarization methods
 """
 
 import os
@@ -15,6 +19,8 @@ import soundfile as sf
 import whisper
 import logging
 from typing import Optional, Dict, Any, List
+import torch
+from speechbrain.pretrained import EncoderClassifier
 
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -39,8 +45,9 @@ class MultichannelTranscriptGenerator:
     Generate transcripts for multichannel audio files.
     
     Supports two modes:
-    1. Custom Diarization: Uses external diarization results (energy, spectral, webrtc, silero)
-    2. Whisper Native: Uses Whisper's built-in speaker diarization
+    1. Whisper Native: Uses Whisper's built-in VAD and also detects language
+    2. Custom Diarization: Uses external diarization results (webrtc, silero)
+       with language hint from Whisper native
     """
     
     def __init__(self, audio_file_path: str, language_hint: Optional[str] = None):
@@ -49,12 +56,13 @@ class MultichannelTranscriptGenerator:
         
         Args:
             audio_file_path: Path to audio file
-            language_hint: Optional language hint (e.g., 'en', 'es', 'en-US')
+            language_hint: Optional language hint (e.g., 'en', 'es', 'en-US').
+                          For diarization mode, this is typically the language
+                          detected by Whisper native.
         """
         self.audio_file_path = audio_file_path
         self.language_hint = language_hint
         self.whisper_model = None  # Lazy load
-        self.detected_language = None  # Cache detected language
         
         # Load audio to detect channels
         self.audio, self.sr = librosa.load(audio_file_path, sr=None, mono=False)
@@ -63,162 +71,100 @@ class MultichannelTranscriptGenerator:
             self.audio = self.audio.reshape(1, -1)
         
         self.num_channels = self.audio.shape[0]
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.lid_model = EncoderClassifier.from_hparams(
+            source="speechbrain/lang-id-voxlingua107-ecapa",
+            run_opts={"device": self.device}
+        )
+
+        self.channel_languages: Dict[int, Dict[str, Any]] = {}
+        self._detect_languages_per_channel()
+
+    def _detect_languages_per_channel(self, min_seconds: float = 5.0):
+        """
+        Detect language per channel using SpeechBrain ECAPA-TDNN.
+        Stores result in self.channel_languages.
+        """
+        print("    Detecting language per channel using SpeechBrain LID...")
+
+        for ch_idx in range(self.num_channels):
+            channel_audio = self.audio[ch_idx]
+
+            # Take up to first N seconds for stability
+            max_samples = int(min_seconds * self.sr)
+            audio_slice = channel_audio[:max_samples]
+
+            # Convert to torch + resample to 16k
+            audio_tensor = torch.tensor(audio_slice, dtype=torch.float32)
+
+            if self.sr != 16000:
+                audio_tensor = torch.nn.functional.interpolate(
+                    audio_tensor.unsqueeze(0).unsqueeze(0),
+                    scale_factor=16000 / self.sr,
+                    mode="linear",
+                    align_corners=False
+                ).squeeze()
+
+            with torch.no_grad():
+                prediction = self.lid_model.classify_batch(audio_tensor.unsqueeze(0))
+
+            lang = prediction[3][0]          # e.g. 'en'
+            score = float(prediction[2][0].max())
+
+            # Whisper only supports ISO-639-1
+            lang = self._get_base_language_code(lang)
+            if not self.is_language_supported(lang):
+                logger.warning(f"Channel {ch_idx}: {lang} not supported by Whisper, falling back to 'en'")
+                lang = "en"
+
+            self.channel_languages[ch_idx] = {
+                "language": lang,
+                "confidence": score
+            }
+
+            print(f"      Channel {ch_idx}: {lang} (confidence={score:.2f})")
+
     
     def _load_whisper_model(self):
-        """
-        Lazy load Whisper model (large-v3 for best accuracy).
-        """
         if self.whisper_model is None:
             print("    Loading Whisper model (large-v3)...")
             self.whisper_model = whisper.load_model("large-v3")
     
     def _get_base_language_code(self, language: Optional[str]) -> Optional[str]:
-        """
-        Extract base language code from dialect specification.
-        
-        Examples:
-            'en-US' -> 'en'
-            'es-MX' -> 'es'
-            'en' -> 'en'
-        """
         if not language:
             return None
-        
-        # If already a base code (2 letters), return as-is
         if len(language) == 2:
             return language.lower()
-        
-        # Extract base language from dialect code
         base_lang = language.split('-')[0].lower()
         return base_lang
     
     def is_language_supported(self, language: Optional[str]) -> bool:
-        """
-        Check if language is supported by Whisper.
-        
-        Args:
-            language: Language code (e.g., 'en', 'es-MX')
-        
-        Returns:
-            True if supported, False otherwise
-        """
         if not language:
-            return True  # Auto-detect is always supported
-        
+            return True
         base_lang = self._get_base_language_code(language)
         return base_lang in WHISPER_SUPPORTED_LANGUAGES
     
-    def detect_language_from_audio(self, diarization_data: Dict[str, Any]) -> str:
-        """
-        Detect language once from a sample of the audio for consistent transcription.
-        Uses the first few speech segments to determine the language.
-        
-        Args:
-            diarization_data: Diarization results containing speech segments
-        
-        Returns:
-            Detected language code (e.g., 'en', 'es')
-        """
-        # If language hint provided, use it
-        if self.language_hint:
-            return self._get_base_language_code(self.language_hint)
-        
-        # If already detected, return cached result
-        if self.detected_language:
-            return self.detected_language
-        
-        # Lazy load model
-        self._load_whisper_model()
-        
-        # Collect first few speech segments for language detection
-        channel_data = diarization_data.get("channel_data", {})
-        sample_segments = []
-        max_samples = 5  # Use first 5 segments for detection
-        
-        for ch_idx in range(self.num_channels):
-            channel_info = channel_data.get(ch_idx, {})
-            speech_segments = channel_info.get("speech_segments", [])
-            
-            for segment in speech_segments[:max_samples]:
-                sample_segments.append((ch_idx, segment))
-                if len(sample_segments) >= max_samples:
-                    break
-            
-            if len(sample_segments) >= max_samples:
-                break
-        
-        if not sample_segments:
-            logger.warning("No speech segments found for language detection")
-            return "en"  # Default fallback
-        
-        # Extract audio from sample segments and detect language
-        try:
-            # Use first segment for language detection
-            ch_idx, segment_info = sample_segments[0]
-            channel_audio = self.audio[ch_idx]
-            
-            start_sample = int(segment_info["start"] * self.sr)
-            end_sample = int(segment_info["end"] * self.sr)
-            segment_audio = channel_audio[start_sample:end_sample]
-            
-            # Create temporary file
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                temp_path = temp_file.name
-                sf.write(temp_path, segment_audio, self.sr)
-                
-                # Detect language using Whisper
-                audio_for_detection = whisper.load_audio(temp_path)
-                audio_for_detection = whisper.pad_or_trim(audio_for_detection)
-                mel = whisper.log_mel_spectrogram(audio_for_detection).to(self.whisper_model.device)
-                _, probs = self.whisper_model.detect_language(mel)
-                detected_lang = max(probs, key=probs.get)
-                
-                # Clean up
-                os.unlink(temp_path)
-                
-                self.detected_language = detected_lang
-                print(f"    Detected language: {detected_lang}")
-                
-                return detected_lang
-                
-        except Exception as e:
-            logger.error(f"Error detecting language: {e}")
-            return "en"  # Default fallback
-    
     def transcribe_segment(self, audio_segment: np.ndarray, segment_info: Dict[str, Any],
-                          channel_idx: int, language_code: str) -> Optional[Dict[str, Any]]:
+                          channel_idx: int) -> Optional[Dict[str, Any]]:
         """
         Transcribe a single speech segment with a specified language.
-        
-        Args:
-            audio_segment: Audio data for the segment
-            segment_info: Segment metadata (start, end times)
-            channel_idx: Channel index
-            language_code: Language to use for transcription
-        
-        Returns:
-            Dictionary with transcription results or None on error
         """
         try:
-            # Lazy load model
             self._load_whisper_model()
+
+            language_code = self.channel_languages[channel_idx]["language"]
             
-            # Create temporary file for segment
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
                 temp_path = temp_file.name
-                
-                # Write segment audio to temporary file
                 sf.write(temp_path, audio_segment, self.sr)
                 
-                # Transcribe using Whisper with specified language
                 transcribe_options = {
                     "verbose": False,
-                    "language": language_code  # Use detected/hint language for all segments
+                    "language": language_code
                 }
                 
                 result = self.whisper_model.transcribe(temp_path, **transcribe_options)
-                
-                # Clean up temp file
                 os.unlink(temp_path)
                 
                 return {
@@ -234,150 +180,73 @@ class MultichannelTranscriptGenerator:
             return None
     
     # =============================================================================
-    # MODE 1: CUSTOM DIARIZATION (Uses external diarization results)
-    # =============================================================================
-    
-    def transcribe_with_custom_diarization(self, diarization_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        MODE 1: Transcribe speech segments using CUSTOM diarization results.
-        
-        Uses diarization results from one of our methods (energy, spectral, webrtc, silero).
-        Detects language once and uses it for all segments for consistency.
-        
-        Args:
-            diarization_data: Diarization results containing speech segments per channel
-        
-        Returns:
-            Dictionary containing transcript segments and metadata
-        """
-        print("    [MODE 1: CUSTOM DIARIZATION]")
-        
-        # Detect language once for the entire audio
-        detected_language = self.detect_language_from_audio(diarization_data)
-        
-        transcribed_segments = []
-        channel_data = diarization_data.get("channel_data", {})
-        
-        # Process each channel
-        for ch_idx in range(self.num_channels):
-            channel_audio = self.audio[ch_idx]
-            channel_info = channel_data.get(ch_idx, {})
-            speech_segments = channel_info.get("speech_segments", [])
-            
-            if not speech_segments:
-                continue
-            
-            print(f"    Transcribing {len(speech_segments)} segments from channel {ch_idx} (language: {detected_language})...")
-            
-            # Transcribe each speech segment with the detected language
-            for segment_info in speech_segments:
-                # Extract audio for this segment
-                start_sample = int(segment_info["start"] * self.sr)
-                end_sample = int(segment_info["end"] * self.sr)
-                segment_audio = channel_audio[start_sample:end_sample]
-                
-                # Skip very short segments
-                if len(segment_audio) < self.sr * 0.1:  # Less than 0.1 seconds
-                    continue
-                
-                # Transcribe segment with detected language
-                result = self.transcribe_segment(segment_audio, segment_info, ch_idx, detected_language)
-                
-                if result:
-                    transcribed_segments.append(result)
-        
-        # Sort all segments by start time, then end time
-        transcribed_segments.sort(key=lambda x: (x["start"], x["end"]))
-        
-        return {
-            "transcription_mode": "custom_diarization",
-            "primary_language": detected_language,
-            "detected_languages": [detected_language],
-            "language_hint_provided": self.language_hint is not None,
-            "language_hint": self.language_hint,
-            "transcript_segments": transcribed_segments,
-            "num_segments": len(transcribed_segments)
-        }
-    
-    # =============================================================================
-    # MODE 2: WHISPER NATIVE DIARIZATION (Uses Whisper's built-in VAD)
+    # MODE 1: WHISPER NATIVE DIARIZATION (runs first to detect language)
     # =============================================================================
     
     def transcribe_with_whisper_native(self) -> Dict[str, Any]:
         """
-        MODE 2: Transcribe using WHISPER's NATIVE speaker diarization.
+        MODE 1: Transcribe using WHISPER's NATIVE speaker diarization.
         
-        Lets Whisper handle both speech detection and transcription using its
-        built-in VAD (Voice Activity Detection). This is simpler but gives less
-        control over diarization parameters.
+        Also performs language detection. The detected language is stored in
+        the transcript output under 'primary_language' so it can be extracted
+        by the caller and passed to diarization-based methods.
         
         Returns:
-            Dictionary containing transcript segments and metadata
+            Dictionary containing transcript segments, metadata, and detected language
         """
-        print("    [MODE 2: WHISPER NATIVE DIARIZATION]")
+        print("    [MODE 1: WHISPER NATIVE DIARIZATION + LANGUAGE DETECTION]")
         
-        # Lazy load model
         self._load_whisper_model()
         
         all_transcribed_segments = []
         detected_languages = set()
         
-        # Process each channel separately
         for ch_idx in range(self.num_channels):
             channel_audio = self.audio[ch_idx]
             
             print(f"    Transcribing channel {ch_idx} with Whisper native diarization...")
             
             try:
-                # Create temporary file for entire channel
                 with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
                     temp_path = temp_file.name
                     sf.write(temp_path, channel_audio, self.sr)
                     
-                    # Transcribe options
                     transcribe_options = {
                         "verbose": False,
-                        "word_timestamps": True,  # Enable word-level timestamps
+                        "word_timestamps": True,
                     }
                     
-                    # Add language hint if provided
+                    # Add language hint if user provided one explicitly
                     if self.language_hint:
-                        transcribe_options["language"] = self._get_base_language_code(self.language_hint)
+                        transcribe_options["language"] = self.channel_languages[ch_idx]["language"]
+                        
+                    # Otherwise let Whisper auto-detect
                     
-                    # Transcribe using Whisper's native VAD and segmentation
                     result = self.whisper_model.transcribe(temp_path, **transcribe_options)
-                    
-                    # Clean up temp file
                     os.unlink(temp_path)
                     
-                    # Extract detected language
-                    detected_lang = result.get("language", "en")
-                    detected_languages.add(detected_lang)
+                    channel_lang = self.channel_languages[ch_idx]["language"]
                     
-                    # Process segments from Whisper's output
                     whisper_segments = result.get("segments", [])
                     
                     for segment in whisper_segments:
-                        # Whisper provides automatic segmentation with timestamps
                         all_transcribed_segments.append({
                             "start": segment["start"],
                             "end": segment["end"],
                             "speaker": f"channel_{ch_idx}",
-                            "detected_language": detected_lang,
+                            "detected_language": channel_lang,
                             "text": segment["text"].strip(),
-                            "confidence": segment.get("no_speech_prob", None)  # Whisper's confidence
+                            "confidence": segment.get("no_speech_prob", None)
                         })
                     
-                    print(f"      ✓ Transcribed {len(whisper_segments)} segments")
+                    print(f"      ✓ Transcribed {len(whisper_segments)} segments (detected: {channel_lang})")
                     
             except Exception as e:
                 logger.error(f"Error transcribing channel {ch_idx} with Whisper native: {e}")
                 continue
         
-        # Sort all segments by start time, then end time
         all_transcribed_segments.sort(key=lambda x: (x["start"], x["end"]))
         
-        # Determine primary language (most common)
         primary_language = max(detected_languages, key=lambda lang: 
                              sum(1 for seg in all_transcribed_segments if seg["detected_language"] == lang)
                              ) if detected_languages else "en"
@@ -393,13 +262,134 @@ class MultichannelTranscriptGenerator:
         }
     
     # =============================================================================
-    # CONVENIENCE METHODS (Backwards compatibility)
+    # MODE 2: CUSTOM DIARIZATION (uses language from Whisper native)
+    # =============================================================================
+    
+    def transcribe_with_custom_diarization(self, diarization_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        MODE 2: Transcribe speech segments using CUSTOM diarization results.
+        
+        Uses diarization results from webrtc or silero.
+        The language_hint (set during __init__) should be the language detected
+        by Whisper native for consistency across all transcript methods.
+        
+        Args:
+            diarization_data: Diarization results containing speech segments per channel
+        
+        Returns:
+            Dictionary containing transcript segments and metadata
+        """
+        print("    [MODE 2: CUSTOM DIARIZATION]")
+        
+        # Use the language hint directly (which should come from Whisper native detection)
+        language_code = self.channel_languages[ch_idx]["language"] if self.language_hint else None
+        
+        # If no language hint was provided (shouldn't happen in normal flow), 
+        # fall back to detecting from audio
+        if not language_code:
+            logger.warning("No language hint provided to custom diarization mode — detecting from audio")
+            language_code = self._detect_language_from_diarization(diarization_data)
+        
+        print(f"    Using language: {language_code}")
+        
+        transcribed_segments = []
+        channel_data = diarization_data.get("channel_data", {})
+        
+        for ch_idx in range(self.num_channels):
+            channel_audio = self.audio[ch_idx]
+            channel_info = channel_data.get(ch_idx, {})
+            speech_segments = channel_info.get("speech_segments", [])
+            
+            if not speech_segments:
+                continue
+            
+            print(f"    Transcribing {len(speech_segments)} segments from channel {ch_idx} (language: {language_code})...")
+            
+            for segment_info in speech_segments:
+                start_sample = int(segment_info["start"] * self.sr)
+                end_sample = int(segment_info["end"] * self.sr)
+                segment_audio = channel_audio[start_sample:end_sample]
+                
+                if len(segment_audio) < self.sr * 0.1:
+                    continue
+                
+                result = self.transcribe_segment(segment_audio, segment_info, ch_idx, language_code)
+                
+                if result:
+                    transcribed_segments.append(result)
+        
+        transcribed_segments.sort(key=lambda x: (x["start"], x["end"]))
+        
+        return {
+            "transcription_mode": "custom_diarization",
+            "primary_language": language_code,
+            "detected_languages": [language_code],
+            "language_hint_provided": self.language_hint is not None,
+            "language_hint": self.language_hint,
+            "language_source": "whisper_native_detection" if self.language_hint else "fallback_detection",
+            "transcript_segments": transcribed_segments,
+            "num_segments": len(transcribed_segments),
+            "channel_languages": self.channel_languages,
+            "language_source": "speechbrain_audio_lid"
+
+        }
+    
+    def _detect_language_from_diarization(self, diarization_data: Dict[str, Any]) -> str:
+        """
+        Fallback language detection from diarization segments.
+        Only used if Whisper native didn't run first (edge case).
+        """
+        self._load_whisper_model()
+        
+        channel_data = diarization_data.get("channel_data", {})
+        sample_segments = []
+        max_samples = 5
+        
+        for ch_idx in range(self.num_channels):
+            channel_info = channel_data.get(ch_idx, {})
+            speech_segments = channel_info.get("speech_segments", [])
+            
+            for segment in speech_segments[:max_samples]:
+                sample_segments.append((ch_idx, segment))
+                if len(sample_segments) >= max_samples:
+                    break
+            if len(sample_segments) >= max_samples:
+                break
+        
+        if not sample_segments:
+            logger.warning("No speech segments found for language detection")
+            return "en"
+        
+        try:
+            ch_idx, segment_info = sample_segments[0]
+            channel_audio = self.audio[ch_idx]
+            
+            start_sample = int(segment_info["start"] * self.sr)
+            end_sample = int(segment_info["end"] * self.sr)
+            segment_audio = channel_audio[start_sample:end_sample]
+            
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                temp_path = temp_file.name
+                sf.write(temp_path, segment_audio, self.sr)
+                
+                audio_for_detection = whisper.load_audio(temp_path)
+                audio_for_detection = whisper.pad_or_trim(audio_for_detection)
+                mel = whisper.log_mel_spectrogram(audio_for_detection).to(self.whisper_model.device)
+                _, probs = self.whisper_model.detect_language(mel)
+                detected_lang = max(probs, key=probs.get)
+                
+                os.unlink(temp_path)
+                
+                print(f"    Fallback language detection: {detected_lang}")
+                return detected_lang
+                
+        except Exception as e:
+            logger.error(f"Error detecting language: {e}")
+            return "en"
+    
+    # =============================================================================
+    # BACKWARDS COMPATIBILITY
     # =============================================================================
     
     def transcribe_speech_segments_from_diarization(self, diarization_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Backwards compatibility wrapper for custom diarization mode.
-        
-        This is the original method name - now redirects to transcribe_with_custom_diarization.
-        """
         return self.transcribe_with_custom_diarization(diarization_data)
