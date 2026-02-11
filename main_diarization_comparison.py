@@ -1,30 +1,24 @@
 """
-Multi-Method Diarization Comparison Module
+Silero VAD + Speaker Embeddings Multi-Speaker Diarization
 
-Takes a multichannel audio file as input and performs speech/silence diarization 
-using FOUR different methods:
-1. Energy-Based Detection (legacy, simple)
-2. Spectral Features Detection (robust, adaptive)
-3. WebRTC VAD (industry-standard)
-4. Silero VAD (deep learning, state-of-the-art)
-
-Generates separate JSON files for each method with comprehensive results.
+Performs multi-speaker diarization on audio files using Silero VAD for speech
+detection combined with ECAPA-TDNN speaker embeddings for speaker identification.
 
 Usage: 
-    # Analyze single audio file with all methods:
-    python3 main_diarization_comparison.py audio.wav
+    # Single audio file:
+    python3 main_silero_multispeaker.py audio.wav
     
-    # Analyze folder with all methods (non-recursive):
-    python3 main_diarization_comparison.py /path/to/audio/folder
+    # Folder (non-recursive):
+    python3 main_silero_multispeaker.py /path/to/audio/folder
     
-    # Analyze all subfolders recursively (each subfolder processed separately):
-    python3 main_diarization_comparison.py /path/to/parent/folder --recursive
+    # Folder (recursive - process all subfolders):
+    python3 main_silero_multispeaker.py /path/to/parent/folder --recursive
     
-    # Analyze with specific methods only:
-    python3 main_diarization_comparison.py audio.wav --methods energy webrtc
+    # Adjust parameters:
+    python3 main_silero_multispeaker.py audio.wav --threshold 0.6 --min-speech 300
     
     # Verbose output:
-    python3 main_diarization_comparison.py audio.wav --verbose
+    python3 main_silero_multispeaker.py audio.wav --verbose
 """
 
 import os
@@ -33,457 +27,13 @@ import logging
 import numpy as np
 import soundfile as sf
 import json
-from typing import Dict, Any, List, Optional, Tuple
-import torchaudio
+from typing import Dict, Any, List, Tuple
 from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore")
 
-# Import all diarization methods
-from diarization_old import AudioDiarization as AudioDiarizationEnergy
-from diarization_spectral_adaptive import AudioDiarization as AudioDiarizationSpectral
-from diarization_webrtc_vad import AudioDiarization as AudioDiarizationWebRTC
-from diarization_silero import AudioDiarization as AudioDiarizationSilero
-
-
-def generate_diarization_energy(audio_file_path: str) -> Dict[str, Any]:
-    """
-    Generate diarization using Energy-Based Detection (legacy method).
-    """
-    try:
-        print("    Method: Energy-Based Detection")
-        print("    - Simple energy thresholding")
-        print("    - Fast but noise-sensitive")
-        
-        diarizer = AudioDiarizationEnergy(audio_file_path)
-        
-        all_speech_segments = []
-        all_silence_segments = []
-        all_leading_silence_segments = []
-        all_trailing_silence_segments = []
-        all_middle_silence_segments = []
-        channel_data = {}
-        
-        # Extract segments from each channel
-        for ch_idx in range(diarizer.num_channels):
-            channel_audio = diarizer.audio[ch_idx]
-            channel_info = diarizer.extract_channel_segments(ch_idx, channel_audio)
-            channel_data[ch_idx] = channel_info
-            
-            # Add speech segments with speaker_id
-            for segment in channel_info["speech_segments"]:
-                all_speech_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "speaker": f"channel_{ch_idx}"
-                })
-            
-            # Add all silence segments
-            for segment in channel_info["silence_segments"]:
-                all_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            # Add categorized silence segments
-            for segment in channel_info.get("leading_silence_segments", []):
-                all_leading_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            for segment in channel_info.get("trailing_silence_segments", []):
-                all_trailing_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            for segment in channel_info.get("middle_silences", []):
-                all_middle_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-        
-        # Sort segments by start time
-        all_speech_segments.sort(key=lambda x: x["start"])
-        all_silence_segments.sort(key=lambda x: x["start"])
-        all_leading_silence_segments.sort(key=lambda x: x["start"])
-        all_trailing_silence_segments.sort(key=lambda x: x["start"])
-        all_middle_silence_segments.sort(key=lambda x: x["start"])
-        
-        # Calculate metrics
-        metrics = diarizer.calculate_metrics(channel_data)
-        
-        return {
-            "method": "energy_based",
-            "method_description": "Simple energy-based detection with fixed dB threshold",
-            "parameters": {
-                "silence_thresh_db": -40,
-                "min_speech_duration": 0.3,
-                "min_silence_duration": 0.3
-            },
-            "speech_segments": all_speech_segments,
-            "all_silence_segments": all_silence_segments,
-            "leading_silence_segments": all_leading_silence_segments,
-            "trailing_silence_segments": all_trailing_silence_segments,
-            "middle_silence_segments": all_middle_silence_segments,
-            "diarization_metrics": metrics,
-            "num_channels": diarizer.num_channels,
-            "sample_rate_hz": diarizer.sr
-        }
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e), "method": "energy_based"}
-
-
-def generate_diarization_spectral(audio_file_path: str, percentile_threshold: int = 30) -> Dict[str, Any]:
-    """
-    Generate diarization using Spectral Features Detection (adaptive method).
-    """
-    try:
-        print("    Method: Spectral Features Detection")
-        print("    - Uses spectral centroid + rolloff")
-        print("    - Adaptive thresholding (noise-robust)")
-        
-        diarizer = AudioDiarizationSpectral(audio_file_path)
-        
-        all_speech_segments = []
-        all_silence_segments = []
-        all_leading_silence_segments = []
-        all_trailing_silence_segments = []
-        all_middle_silence_segments = []
-        channel_data = {}
-        
-        # Extract segments from each channel
-        for ch_idx in range(diarizer.num_channels):
-            channel_audio = diarizer.audio[ch_idx]
-            channel_info = diarizer.extract_channel_segments(
-                ch_idx, 
-                channel_audio, 
-                percentile_threshold=percentile_threshold
-            )
-            channel_data[ch_idx] = channel_info
-            
-            # Add speech segments
-            for segment in channel_info["speech_segments"]:
-                all_speech_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "speaker": f"channel_{ch_idx}"
-                })
-            
-            # Add silence segments
-            for segment in channel_info["silence_segments"]:
-                all_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            # Add categorized silence segments
-            for segment in channel_info.get("leading_silence_segments", []):
-                all_leading_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            for segment in channel_info.get("trailing_silence_segments", []):
-                all_trailing_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            for segment in channel_info.get("middle_silences", []):
-                all_middle_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-        
-        # Sort segments
-        all_speech_segments.sort(key=lambda x: x["start"])
-        all_silence_segments.sort(key=lambda x: x["start"])
-        all_leading_silence_segments.sort(key=lambda x: x["start"])
-        all_trailing_silence_segments.sort(key=lambda x: x["start"])
-        all_middle_silence_segments.sort(key=lambda x: x["start"])
-        
-        # Calculate metrics
-        metrics = diarizer.calculate_metrics(channel_data)
-        
-        return {
-            "method": "spectral_features",
-            "method_description": "Spectral features (centroid + rolloff) with adaptive thresholding",
-            "parameters": {
-                "percentile_threshold": percentile_threshold,
-                "hop_length": 512,
-                "min_speech_duration": 0.3,
-                "min_silence_duration": 0.3
-            },
-            "speech_segments": all_speech_segments,
-            "all_silence_segments": all_silence_segments,
-            "leading_silence_segments": all_leading_silence_segments,
-            "trailing_silence_segments": all_trailing_silence_segments,
-            "middle_silence_segments": all_middle_silence_segments,
-            "diarization_metrics": metrics,
-            "num_channels": diarizer.num_channels,
-            "sample_rate_hz": diarizer.sr
-        }
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e), "method": "spectral_features"}
-
-
-def generate_diarization_webrtc(audio_file_path: str, vad_aggressiveness: int = 2) -> Dict[str, Any]:
-    """
-    Generate diarization using WebRTC VAD (industry-standard method).
-    """
-    try:
-        print("    Method: WebRTC VAD")
-        print("    - Industry-standard voice activity detection")
-        print(f"    - Aggressiveness: {vad_aggressiveness} (0=quality, 3=very aggressive)")
-        
-        diarizer = AudioDiarizationWebRTC(audio_file_path, vad_aggressiveness=vad_aggressiveness)
-        
-        all_speech_segments = []
-        all_silence_segments = []
-        all_leading_silence_segments = []
-        all_trailing_silence_segments = []
-        all_middle_silence_segments = []
-        channel_data = {}
-        
-        # Extract segments from each channel
-        for ch_idx in range(diarizer.num_channels):
-            channel_audio = diarizer.audio[ch_idx]
-            channel_info = diarizer.extract_channel_segments(ch_idx, channel_audio)
-            channel_data[ch_idx] = channel_info
-            
-            # Add speech segments
-            for segment in channel_info["speech_segments"]:
-                all_speech_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "speaker": f"channel_{ch_idx}"
-                })
-            
-            # Add silence segments
-            for segment in channel_info["silence_segments"]:
-                all_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            # Add categorized silence segments
-            for segment in channel_info.get("leading_silence_segments", []):
-                all_leading_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            for segment in channel_info.get("trailing_silence_segments", []):
-                all_trailing_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            for segment in channel_info.get("middle_silences", []):
-                all_middle_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-        
-        # Sort segments
-        all_speech_segments.sort(key=lambda x: x["start"])
-        all_silence_segments.sort(key=lambda x: x["start"])
-        all_leading_silence_segments.sort(key=lambda x: x["start"])
-        all_trailing_silence_segments.sort(key=lambda x: x["start"])
-        all_middle_silence_segments.sort(key=lambda x: x["start"])
-        
-        # Calculate metrics
-        metrics = diarizer.calculate_metrics(channel_data)
-        
-        return {
-            "method": "webrtc_vad",
-            "method_description": "WebRTC Voice Activity Detection (GMM-based)",
-            "parameters": {
-                "vad_aggressiveness": vad_aggressiveness,
-                "frame_duration_ms": 30,
-                "min_speech_duration": 0.3,
-                "min_silence_duration": 0.3
-            },
-            "speech_segments": all_speech_segments,
-            "all_silence_segments": all_silence_segments,
-            "leading_silence_segments": all_leading_silence_segments,
-            "trailing_silence_segments": all_trailing_silence_segments,
-            "middle_silence_segments": all_middle_silence_segments,
-            "diarization_metrics": metrics,
-            "num_channels": diarizer.num_channels,
-            "sample_rate_hz": diarizer.sr
-        }
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e), "method": "webrtc_vad"}
-
-
-def generate_diarization_silero(audio_file_path: str, 
-                                threshold: float = 0.5,
-                                min_speech_duration_ms: int = 250,
-                                min_silence_duration_ms: int = 100) -> Dict[str, Any]:
-    """
-    Generate diarization using Silero VAD (deep learning method).
-    """
-    try:
-        print("    Method: Silero VAD")
-        print("    - Deep learning (neural network)")
-        print("    - State-of-the-art accuracy")
-        
-        diarizer = AudioDiarizationSilero(
-            audio_file_path,
-            threshold=threshold,
-            min_speech_duration_ms=min_speech_duration_ms,
-            min_silence_duration_ms=min_silence_duration_ms
-        )
-        
-        all_speech_segments = []
-        all_silence_segments = []
-        all_leading_silence_segments = []
-        all_trailing_silence_segments = []
-        all_middle_silence_segments = []
-        channel_data = {}
-        
-        # Extract segments from each channel
-        for ch_idx in range(diarizer.num_channels):
-            channel_audio = diarizer.audio[ch_idx]
-            channel_info = diarizer.extract_channel_segments(ch_idx, channel_audio)
-            channel_data[ch_idx] = channel_info
-            
-            # Add speech segments
-            for segment in channel_info["speech_segments"]:
-                all_speech_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "speaker": f"channel_{ch_idx}"
-                })
-            
-            # Add silence segments
-            for segment in channel_info["silence_segments"]:
-                all_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            # Add categorized silence segments
-            for segment in channel_info.get("leading_silence_segments", []):
-                all_leading_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            for segment in channel_info.get("trailing_silence_segments", []):
-                all_trailing_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-            
-            for segment in channel_info.get("middle_silences", []):
-                all_middle_silence_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "duration": segment["duration"],
-                    "channel": ch_idx
-                })
-        
-        # Sort segments
-        all_speech_segments.sort(key=lambda x: x["start"])
-        all_silence_segments.sort(key=lambda x: x["start"])
-        all_leading_silence_segments.sort(key=lambda x: x["start"])
-        all_trailing_silence_segments.sort(key=lambda x: x["start"])
-        all_middle_silence_segments.sort(key=lambda x: x["start"])
-        
-        # Calculate metrics
-        metrics = diarizer.calculate_metrics(channel_data)
-        
-        return {
-            "method": "silero_vad",
-            "method_description": "Silero VAD - Deep Learning Neural Network",
-            "parameters": {
-                "threshold": threshold,
-                "min_speech_duration_ms": min_speech_duration_ms,
-                "min_silence_duration_ms": min_silence_duration_ms,
-                "window_size_samples": 512,
-                "speech_pad_ms": 30
-            },
-            "speech_segments": all_speech_segments,
-            "all_silence_segments": all_silence_segments,
-            "leading_silence_segments": all_leading_silence_segments,
-            "trailing_silence_segments": all_trailing_silence_segments,
-            "middle_silence_segments": all_middle_silence_segments,
-            "diarization_metrics": metrics,
-            "num_channels": diarizer.num_channels,
-            "sample_rate_hz": diarizer.sr
-        }
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e), "method": "silero_vad"}
-
-
-def find_audio_files(folder_path: Path) -> List[Path]:
-    """
-    Find all audio files in the given folder (non-recursive)
-    """
-    audio_files = []
-    if folder_path.is_dir():
-        for file in folder_path.iterdir():
-            if file.is_file() and file.suffix.lower() in ['.wav', '.mp3', '.m4a', '.flac', '.aac', '.ogg', '.wma', '.aiff', '.au']:
-                audio_files.append(file)
-    return sorted(audio_files)
-
-
-def find_subfolders(parent_path: Path) -> List[Path]:
-    """
-    Find all immediate subfolders in the given parent folder
-    """
-    subfolders = []
-    if parent_path.is_dir():
-        for item in parent_path.iterdir():
-            if item.is_dir():
-                subfolders.append(item)
-    return sorted(subfolders)
+# Import the multi-speaker diarization module
+from diarization_silero_mulri_speaker import AudioDiarization
 
 
 def convert_numpy_types(obj):
@@ -497,6 +47,26 @@ def convert_numpy_types(obj):
     if isinstance(obj, list):
         return [convert_numpy_types(elem) for elem in obj]
     return obj
+
+
+def print_speaker_summary(channel_data: Dict):
+    """
+    Print a summary of detected speakers per channel
+    """
+    for ch_idx, ch_data in channel_data.items():
+        num_speakers = ch_data.get("num_speakers", 0)
+        multispeaker = ch_data.get("multispeaker_likelihood", False)
+        speaker_ratios = ch_data.get("speech_ratio_for_all_speakers_across_channel", {})
+        
+        print(f"      Channel {ch_idx}:")
+        print(f"        Speakers detected: {num_speakers}")
+        print(f"        Multi-speaker: {'Yes' if multispeaker else 'No'}")
+        
+        if speaker_ratios:
+            print(f"        Speech distribution:")
+            for speaker, ratio in sorted(speaker_ratios.items()):
+                percentage = ratio * 100
+                print(f"          {speaker}: {percentage:.1f}%")
 
 
 def print_diarization_summary(result: Dict[str, Any]):
@@ -524,24 +94,186 @@ def print_diarization_summary(result: Dict[str, Any]):
     print(f"    Avg silence: {metrics.get('avg_silence_percentage', 0):.1f}%")
 
 
-def process_folder(folder_path: Path, methods_to_use: List[str], verbose: bool) -> Tuple[int, int, Dict[str, Dict[str, int]]]:
+def generate_diarization_silero_multispeaker(audio_file_path: str, 
+                                             threshold: float = 0.5,
+                                             min_speech_duration_ms: int = 250,
+                                             min_silence_duration_ms: int = 100,
+                                             verbose: bool = False) -> Dict[str, Any]:
     """
-    Process all audio files in a single folder with all selected methods.
+    Generate diarization using Silero VAD + Speaker Embeddings.
+    
+    Args:
+        audio_file_path: Path to audio file
+        threshold: VAD threshold (0.0-1.0)
+        min_speech_duration_ms: Minimum speech segment duration
+        min_silence_duration_ms: Minimum silence gap duration
+        verbose: Enable verbose output
+        
+    Returns:
+        Dictionary containing all diarization results
+    """
+    try:
+        if verbose:
+            print("    Method: Silero VAD + Speaker Embeddings")
+            print("    - Deep learning VAD + ECAPA-TDNN embeddings")
+            print("    - Multi-speaker detection within channels")
+        
+        diarizer = AudioDiarization(
+            audio_file_path,
+            threshold=threshold,
+            min_speech_duration_ms=min_speech_duration_ms,
+            min_silence_duration_ms=min_silence_duration_ms
+        )
+        
+        all_speech_segments = []
+        all_silence_segments = []
+        all_leading_silence_segments = []
+        all_trailing_silence_segments = []
+        all_middle_silence_segments = []
+        channel_data = {}
+        
+        # Extract segments from each channel
+        for ch_idx in range(diarizer.num_channels):
+            channel_audio = diarizer.audio[ch_idx]
+            channel_info = diarizer.extract_channel_segments(ch_idx, channel_audio)
+            channel_data[ch_idx] = channel_info
+            
+            # Add speech segments with speaker labels
+            for segment in channel_info["speech_segments"]:
+                all_speech_segments.append({
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "speaker": segment.get("speaker", f"channel_{ch_idx}_speaker_unknown"),
+                    "channel": ch_idx
+                })
+            
+            # Add silence segments
+            for segment in channel_info["silence_segments"]:
+                all_silence_segments.append({
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "duration": segment["duration"],
+                    "channel": ch_idx
+                })
+            
+            # Add categorized silence segments
+            for segment in channel_info.get("leading_silence_segments", []):
+                all_leading_silence_segments.append({
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "duration": segment["duration"],
+                    "channel": ch_idx
+                })
+            
+            for segment in channel_info.get("trailing_silence_segments", []):
+                all_trailing_silence_segments.append({
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "duration": segment["duration"],
+                    "channel": ch_idx
+                })
+            
+            for segment in channel_info.get("middle_silences", []):
+                all_middle_silence_segments.append({
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "duration": segment["duration"],
+                    "channel": ch_idx
+                })
+        
+        # Sort segments
+        all_speech_segments.sort(key=lambda x: x["start"])
+        all_silence_segments.sort(key=lambda x: x["start"])
+        all_leading_silence_segments.sort(key=lambda x: x["start"])
+        all_trailing_silence_segments.sort(key=lambda x: x["start"])
+        all_middle_silence_segments.sort(key=lambda x: x["start"])
+        
+        # Calculate metrics
+        metrics = diarizer.calculate_metrics(channel_data)
+        
+        # Add multi-speaker metadata per channel
+        channel_metadata = {}
+        for ch_idx, ch_data in channel_data.items():
+            channel_metadata[f"channel_{ch_idx}"] = {
+                "multispeaker_likelihood": ch_data.get("multispeaker_likelihood", False),
+                "potential_number_of_speakers_in_channel": ch_data.get("potential_number_of_speakers_in_channel", 0),
+                "speech_ratio_for_all_speakers_across_channel": ch_data.get("speech_ratio_for_all_speakers_across_channel", {})
+            }
+        
+        return {
+            "method": "silero_vad_multispeaker",
+            "method_description": "Silero VAD + Speaker Embeddings (ECAPA-TDNN) with agglomerative clustering",
+            "parameters": {
+                "threshold": threshold,
+                "min_speech_duration_ms": min_speech_duration_ms,
+                "min_silence_duration_ms": min_silence_duration_ms,
+                "window_size_samples": 512,
+                "speech_pad_ms": 30,
+                "embedding_model": "speechbrain/spkrec-ecapa-voxceleb",
+                "clustering_method": "agglomerative",
+                "clustering_metric": "cosine"
+            },
+            "speech_segments": all_speech_segments,
+            "all_silence_segments": all_silence_segments,
+            "leading_silence_segments": all_leading_silence_segments,
+            "trailing_silence_segments": all_trailing_silence_segments,
+            "middle_silence_segments": all_middle_silence_segments,
+            "diarization_metrics": metrics,
+            "num_channels": diarizer.num_channels,
+            "sample_rate_hz": diarizer.sr,
+            "multispeaker_metadata": channel_metadata,
+            "channel_data": channel_data  # Include full channel data for summary
+        }
+        
+    except Exception as e:
+        import traceback
+        if verbose:
+            traceback.print_exc()
+        return {"error": str(e), "method": "silero_vad_multispeaker"}
+
+
+def find_audio_files(folder_path: Path) -> List[Path]:
+    """
+    Find all audio files in the given folder (non-recursive)
+    """
+    audio_files = []
+    if folder_path.is_dir():
+        for file in folder_path.iterdir():
+            if file.is_file() and file.suffix.lower() in ['.wav', '.mp3', '.m4a', '.flac', '.aac', '.ogg', '.wma', '.aiff', '.au']:
+                audio_files.append(file)
+    return sorted(audio_files)
+
+
+def find_subfolders(parent_path: Path) -> List[Path]:
+    """
+    Find all immediate subfolders in the given parent folder
+    """
+    subfolders = []
+    if parent_path.is_dir():
+        for item in parent_path.iterdir():
+            if item.is_dir():
+                subfolders.append(item)
+    return sorted(subfolders)
+
+
+def process_folder(folder_path: Path, threshold: float, min_speech_ms: int, 
+                   min_silence_ms: int, verbose: bool) -> Tuple[int, int]:
+    """
+    Process all audio files in a single folder.
     
     Returns:
-        Tuple of (processed_count, error_count, method_stats)
+        Tuple of (processed_count, error_count)
     """
     audio_files = find_audio_files(folder_path)
     
     if not audio_files:
         print(f"  No audio files found in {folder_path.name}")
-        return 0, 0, {method: {'success': 0, 'error': 0} for method in methods_to_use}
+        return 0, 0
     
     print(f"  Found {len(audio_files)} audio file(s)")
     
     processed_count = 0
     error_count = 0
-    method_stats = {method: {'success': 0, 'error': 0} for method in methods_to_use}
     
     for i, audio_file in enumerate(audio_files, 1):
         print(f"\n  [{i}/{len(audio_files)}] Processing: {audio_file.name}")
@@ -551,59 +283,43 @@ def process_folder(folder_path: Path, methods_to_use: List[str], verbose: bool) 
             info = sf.info(str(audio_file))
             print(f"    Channels: {info.channels}, Sample Rate: {info.samplerate} Hz, Duration: {info.duration:.2f}s")
             
-            # Process with each selected method
-            for method in methods_to_use:
-                print(f"\n    [{method.upper()}] Running diarization...")
-                
-                try:
-                    # Generate diarization based on method
-                    if method == 'energy':
-                        result = generate_diarization_energy(str(audio_file))
-                        output_suffix = "energy_based"
-                    elif method == 'spectral':
-                        result = generate_diarization_spectral(str(audio_file))
-                        output_suffix = "spectral_features"
-                    elif method == 'webrtc':
-                        result = generate_diarization_webrtc(str(audio_file))
-                        output_suffix = "webrtc_vad"
-                    elif method == 'silero':
-                        result = generate_diarization_silero(str(audio_file))
-                        output_suffix = "silero_vad"
-                    
-                    # Convert numpy types
-                    result = convert_numpy_types(result)
-                    
-                    # Add audio file info
-                    result['audio_file'] = str(audio_file)
-                    result['audio_metadata'] = {
-                        'num_channels': info.channels,
-                        'sample_rate_hz': info.samplerate,
-                        'duration_sec': round(info.duration, 3),
-                        'bit_depth': info.subtype
-                    }
-                    
-                    # Save JSON
-                    output_json_path = audio_file.parent / f"{audio_file.stem}_diarization_{output_suffix}.json"
-                    with open(output_json_path, 'w', encoding='utf-8') as f:
-                        json.dump(result, f, indent=2, ensure_ascii=False)
-                    
-                    print(f"      ✓ Saved: {output_json_path.name}")
-                    
-                    # Print summary
-                    print_diarization_summary(result)
-                    
-                    # Update stats
-                    if "error" in result:
-                        method_stats[method]['error'] += 1
-                    else:
-                        method_stats[method]['success'] += 1
-                    
-                except Exception as e:
-                    print(f"      ✗ Error in {method}: {e}")
-                    if verbose:
-                        import traceback
-                        traceback.print_exc()
-                    method_stats[method]['error'] += 1
+            # Generate diarization
+            result = generate_diarization_silero_multispeaker(
+                str(audio_file),
+                threshold=threshold,
+                min_speech_duration_ms=min_speech_ms,
+                min_silence_duration_ms=min_silence_ms,
+                verbose=verbose
+            )
+            
+            # Convert numpy types
+            result = convert_numpy_types(result)
+            
+            # Add audio file info
+            result['audio_file'] = str(audio_file)
+            result['audio_metadata'] = {
+                'num_channels': info.channels,
+                'sample_rate_hz': info.samplerate,
+                'duration_sec': round(info.duration, 3),
+                'bit_depth': info.subtype
+            }
+            
+            # Remove channel_data from output (it's large and redundant)
+            channel_data = result.pop('channel_data', {})
+            
+            # Save JSON
+            output_json_path = audio_file.parent / f"{audio_file.stem}_diarization_silero_multispeaker.json"
+            with open(output_json_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            
+            print(f"    ✓ Saved: {output_json_path.name}")
+            
+            # Print summary
+            print(f"\n    Multi-Speaker Detection Results:")
+            print_speaker_summary(channel_data)
+            
+            print(f"\n    Overall Metrics:")
+            print_diarization_summary(result)
             
             processed_count += 1
             
@@ -614,24 +330,26 @@ def process_folder(folder_path: Path, methods_to_use: List[str], verbose: bool) 
                 traceback.print_exc()
             error_count += 1
     
-    return processed_count, error_count, method_stats
+    return processed_count, error_count
 
 
 def main():
     """
-    Main function to perform multi-method diarization comparison.
+    Main function to perform multi-speaker diarization.
     """
     parser = argparse.ArgumentParser(
-        description="Compare multiple diarization methods on audio files"
+        description="Multi-speaker diarization using Silero VAD + Speaker Embeddings"
     )
     parser.add_argument("input_path", type=str, 
                        help="Path to audio file or folder containing audio files/subfolders")
-    parser.add_argument("--methods", nargs='+', 
-                       choices=['energy', 'spectral', 'webrtc', 'silero', 'all'],
-                       default=['all'],
-                       help="Methods to use (default: all)")
+    parser.add_argument("--threshold", type=float, default=0.5,
+                       help="VAD threshold (0.0-1.0, default: 0.5)")
+    parser.add_argument("--min-speech", type=int, default=250,
+                       help="Minimum speech duration in ms (default: 250)")
+    parser.add_argument("--min-silence", type=int, default=100,
+                       help="Minimum silence duration in ms (default: 100)")
     parser.add_argument("--recursive", action="store_true",
-                       help="Process each subfolder separately (creates diarization files in each subfolder)")
+                       help="Process each subfolder separately")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose logging")
     
@@ -640,12 +358,6 @@ def main():
     # Set logging level
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
-    
-    # Determine which methods to use
-    if 'all' in args.methods:
-        methods_to_use = ['energy', 'spectral', 'webrtc', 'silero']
-    else:
-        methods_to_use = args.methods
     
     # Validate input path
     input_path = Path(args.input_path)
@@ -656,25 +368,86 @@ def main():
     # Single file mode
     if input_path.is_file():
         print(f"\n{'='*80}")
-        print(f"MULTI-METHOD DIARIZATION COMPARISON - SINGLE FILE")
+        print(f"SILERO VAD + SPEAKER EMBEDDINGS MULTI-SPEAKER DIARIZATION")
         print(f"Target File: {input_path.absolute()}")
-        print(f"Methods: {', '.join(methods_to_use)}")
+        print(f"Parameters: threshold={args.threshold}, min_speech={args.min_speech}ms, min_silence={args.min_silence}ms")
         print(f"{'='*80}")
         
         # Process single file
         folder_path = input_path.parent
-        audio_files = [input_path]
         
-        processed_count, error_count, method_stats = process_folder(folder_path, methods_to_use, args.verbose)
+        # Get audio metadata
+        info = sf.info(str(input_path))
+        print(f"\nAudio Info:")
+        print(f"  Channels: {info.channels}")
+        print(f"  Sample Rate: {info.samplerate} Hz")
+        print(f"  Duration: {info.duration:.2f}s")
+        print(f"  Bit Depth: {info.subtype}")
         
+        print(f"\nProcessing...")
+        
+        try:
+            # Generate diarization
+            result = generate_diarization_silero_multispeaker(
+                str(input_path),
+                threshold=args.threshold,
+                min_speech_duration_ms=args.min_speech,
+                min_silence_duration_ms=args.min_silence,
+                verbose=args.verbose
+            )
+            
+            # Convert numpy types
+            result = convert_numpy_types(result)
+            
+            # Add audio file info
+            result['audio_file'] = str(input_path)
+            result['audio_metadata'] = {
+                'num_channels': info.channels,
+                'sample_rate_hz': info.samplerate,
+                'duration_sec': round(info.duration, 3),
+                'bit_depth': info.subtype
+            }
+            
+            # Remove channel_data from output
+            channel_data = result.pop('channel_data', {})
+            
+            # Save JSON
+            output_json_path = input_path.parent / f"{input_path.stem}_diarization_silero_multispeaker.json"
+            with open(output_json_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2, ensure_ascii=False)
+            
+            print(f"\n✓ Saved: {output_json_path}")
+            
+            # Print summary
+            print(f"\n{'='*80}")
+            print("MULTI-SPEAKER DETECTION RESULTS")
+            print(f"{'='*80}")
+            print_speaker_summary(channel_data)
+            
+            print(f"\n{'='*80}")
+            print("OVERALL METRICS")
+            print(f"{'='*80}")
+            print_diarization_summary(result)
+            
+            processed_count = 1
+            error_count = 0
+            
+        except Exception as e:
+            print(f"\n✗ Error: {e}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
+            processed_count = 0
+            error_count = 1
+    
     # Folder mode
     elif input_path.is_dir():
         # Recursive subfolder mode
         if args.recursive:
             print(f"\n{'='*80}")
-            print(f"MULTI-METHOD DIARIZATION COMPARISON - RECURSIVE SUBFOLDER MODE")
+            print(f"SILERO VAD + SPEAKER EMBEDDINGS - RECURSIVE SUBFOLDER MODE")
             print(f"Parent Folder: {input_path.absolute()}")
-            print(f"Methods: {', '.join(methods_to_use)}")
+            print(f"Parameters: threshold={args.threshold}, min_speech={args.min_speech}ms, min_silence={args.min_silence}ms")
             print(f"{'='*80}")
             
             # Find all subfolders
@@ -690,22 +463,22 @@ def main():
             # Process each subfolder
             total_processed = 0
             total_errors = 0
-            global_method_stats = {method: {'success': 0, 'error': 0} for method in methods_to_use}
             
             for idx, subfolder in enumerate(subfolders, 1):
                 print(f"\n{'='*80}")
                 print(f"[SUBFOLDER {idx}/{len(subfolders)}] Processing: {subfolder.name}")
                 print(f"{'='*80}")
                 
-                processed, errors, method_stats = process_folder(subfolder, methods_to_use, args.verbose)
+                processed, errors = process_folder(
+                    subfolder, 
+                    args.threshold, 
+                    args.min_speech, 
+                    args.min_silence,
+                    args.verbose
+                )
                 
                 total_processed += processed
                 total_errors += errors
-                
-                # Aggregate method stats
-                for method in methods_to_use:
-                    global_method_stats[method]['success'] += method_stats[method]['success']
-                    global_method_stats[method]['error'] += method_stats[method]['error']
                 
                 print(f"\n  Subfolder Summary:")
                 print(f"    Files processed: {processed}")
@@ -713,17 +486,22 @@ def main():
             
             processed_count = total_processed
             error_count = total_errors
-            method_stats = global_method_stats
             
         # Non-recursive folder mode
         else:
             print(f"\n{'='*80}")
-            print(f"MULTI-METHOD DIARIZATION COMPARISON - FOLDER MODE")
+            print(f"SILERO VAD + SPEAKER EMBEDDINGS - FOLDER MODE")
             print(f"Target Folder: {input_path.absolute()}")
-            print(f"Methods: {', '.join(methods_to_use)}")
+            print(f"Parameters: threshold={args.threshold}, min_speech={args.min_speech}ms, min_silence={args.min_silence}ms")
             print(f"{'='*80}")
             
-            processed_count, error_count, method_stats = process_folder(input_path, methods_to_use, args.verbose)
+            processed_count, error_count = process_folder(
+                input_path, 
+                args.threshold, 
+                args.min_speech, 
+                args.min_silence,
+                args.verbose
+            )
     
     else:
         print(f"Error: {input_path.absolute()} is not a valid file or directory")
@@ -731,36 +509,27 @@ def main():
     
     # Print final summary
     print(f"\n{'='*80}")
-    print("DIARIZATION COMPARISON SUMMARY")
+    print("DIARIZATION SUMMARY")
     print(f"{'='*80}")
     print(f"Total files processed: {processed_count}")
     print(f"Total errors encountered: {error_count}")
-    print(f"\nMethod Statistics:")
-    
-    for method in methods_to_use:
-        stats = method_stats[method]
-        total = stats['success'] + stats['error']
-        success_rate = (stats['success'] / total * 100) if total > 0 else 0
-        print(f"  {method.upper():12s}: {stats['success']}/{total} successful ({success_rate:.1f}%)")
     
     if processed_count > 0:
-        print(f"\n✓ Diarization comparison completed!")
-        print(f"\nGenerated JSON files per method:")
-        if 'energy' in methods_to_use:
-            print(f"  - *_diarization_energy_based.json")
-        if 'spectral' in methods_to_use:
-            print(f"  - *_diarization_spectral_features.json")
-        if 'webrtc' in methods_to_use:
-            print(f"  - *_diarization_webrtc_vad.json")
-        if 'silero' in methods_to_use:
-            print(f"  - *_diarization_silero_vad.json")
+        success_rate = (processed_count / (processed_count + error_count) * 100)
+        print(f"Success rate: {success_rate:.1f}%")
         
-        print(f"\nEach file contains:")
+        print(f"\n✓ Multi-speaker diarization completed!")
+        print(f"\nOutput files: *_diarization_silero_multispeaker.json")
+        print(f"\nJSON structure includes:")
         print(f"  ├── method & description")
         print(f"  ├── parameters used")
-        print(f"  ├── speech_segments (with speaker/channel)")
+        print(f"  ├── speech_segments (with speaker labels per channel)")
         print(f"  ├── silence_segments (all, leading, trailing, middle)")
         print(f"  ├── diarization_metrics (balance, naturalness, etc.)")
+        print(f"  ├── multispeaker_metadata:")
+        print(f"  │   ├── multispeaker_likelihood (bool)")
+        print(f"  │   ├── potential_number_of_speakers_in_channel (int)")
+        print(f"  │   └── speech_ratio_for_all_speakers_across_channel (dict)")
         print(f"  └── audio_metadata")
     
     print(f"{'='*80}\n")
