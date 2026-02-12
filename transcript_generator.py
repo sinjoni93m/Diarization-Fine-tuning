@@ -105,10 +105,12 @@ class TranscriptGenerator:
         """
         Align Whisper words to diarization speech segments.
 
-        A word is assigned to a diarization segment if its midpoint falls within
-        [segment_start - tolerance, segment_end + tolerance].
+        Each word is assigned to the diarization segment that overlaps it most.
+        Handles overlapping diarization segments (e.g., Speaker_0 and Speaker_2
+        at the same time) by picking the segment whose time range best covers
+        the word.
 
-        Words outside any segment are dropped (silence hallucinations).
+        Words outside all segments are dropped (silence hallucinations).
 
         Args:
             words: [{"word", "start", "end"}, ...] from Whisper
@@ -122,40 +124,75 @@ class TranscriptGenerator:
             return []
 
         words_sorted = sorted(words, key=lambda w: w["start"])
-        segs_sorted = sorted(speech_segments, key=lambda s: s["start"])
+        segs_sorted = sorted(speech_segments, key=lambda s: (s["start"], s["end"]))
 
+        # Step 1: Assign each word to its best-matching diarization segment
+        # For each word, find all overlapping segments and pick the one with most overlap
+        word_assignments = []  # (seg_index, word) pairs
+
+        for w in words_sorted:
+            w_start = w["start"]
+            w_end = w["end"]
+            w_mid = (w_start + w_end) / 2.0
+
+            best_seg_idx = None
+            best_overlap = 0.0
+
+            for seg_idx, seg in enumerate(segs_sorted):
+                seg_start = seg["start"] - tolerance
+                seg_end = seg["end"] + tolerance
+
+                # Quick skip: if segment starts well after word, no more candidates
+                if seg_start > w_end + tolerance:
+                    break
+
+                # Skip segments that end before word
+                if seg_end < w_start - tolerance:
+                    continue
+
+                # Calculate overlap between word and segment
+                overlap_start = max(w_start, seg_start)
+                overlap_end = min(w_end, seg_end)
+                overlap = max(0.0, overlap_end - overlap_start)
+
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_seg_idx = seg_idx
+                elif overlap == best_overlap and overlap > 0:
+                    # Tie-break: prefer the segment whose center is closer to word midpoint
+                    if best_seg_idx is not None:
+                        prev_center = (segs_sorted[best_seg_idx]["start"] + segs_sorted[best_seg_idx]["end"]) / 2.0
+                        curr_center = (seg["start"] + seg["end"]) / 2.0
+                        if abs(curr_center - w_mid) < abs(prev_center - w_mid):
+                            best_seg_idx = seg_idx
+
+            if best_seg_idx is not None:
+                word_assignments.append((best_seg_idx, w))
+
+        # Step 2: Group words by their assigned segment
+        from collections import defaultdict
+        seg_words_map = defaultdict(list)
+        for seg_idx, w in word_assignments:
+            seg_words_map[seg_idx].append(w)
+
+        # Step 3: Build output segments preserving original diarization order
         aligned = []
-        word_idx = 0
+        for seg_idx, seg in enumerate(segs_sorted):
+            seg_word_list = seg_words_map.get(seg_idx, [])
+            if not seg_word_list:
+                continue
 
-        for seg in segs_sorted:
-            seg_start = seg["start"] - tolerance
-            seg_end = seg["end"] + tolerance
+            # Sort words within segment by time
+            seg_word_list.sort(key=lambda w: w["start"])
+            text = " ".join(w["word"] for w in seg_word_list)
             speaker = seg.get("speaker", "unknown")
 
-            seg_words = []
-
-            # Move word pointer past words that are before this segment
-            while word_idx < len(words_sorted):
-                w = words_sorted[word_idx]
-                w_mid = (w["start"] + w["end"]) / 2.0
-
-                if w_mid < seg_start:
-                    word_idx += 1
-                    continue
-                elif w_mid > seg_end:
-                    break
-                else:
-                    seg_words.append(w)
-                    word_idx += 1
-
-            if seg_words:
-                text = " ".join(w["word"] for w in seg_words)
-                aligned.append({
-                    "start": seg_words[0]["start"],
-                    "end": seg_words[-1]["end"],
-                    "speaker": speaker,
-                    "text": text
-                })
+            aligned.append({
+                "start": seg_word_list[0]["start"],
+                "end": seg_word_list[-1]["end"],
+                "speaker": speaker,
+                "text": text
+            })
 
         return aligned
 

@@ -186,6 +186,7 @@ def build_metrics(diarization_result, silence_segments, silence_types):
         "leading_silence_sec": round(sum(s["duration"] for s in silence_types["leading"]), 3),
         "trailing_silence_sec": round(sum(s["duration"] for s in silence_types["trailing"]), 3),
         "middle_silence_sec": round(sum(s["duration"] for s in silence_types["middle"]), 3),
+        "max_middle_silence_sec": round(max((s["duration"] for s in silence_types["middle"]), default=0.0), 3),
         "middle_silence_count": len(silence_types["middle"]),
     }
 
