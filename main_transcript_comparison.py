@@ -1,23 +1,19 @@
 """
-Multi-Method Transcript Comparison Module - Using Existing Diarization Files
+Transcript Generation Module - Using Existing Silero+Embedding Diarization Files
 
 Takes a parent folder path and processes each subfolder:
-1. Finds all audio files and their corresponding diarization JSON files
-2. Creates a "subfolder_id_transcripts" folder within each subfolder
-3. Generates transcripts using:
-   - Whisper Native (no external diarization) — detects language from raw audio using Whisper
-   - Custom Diarization: Uses existing WebRTC diarization JSON files — detects language from speech segments using Whisper
-   - Custom Diarization: Uses existing Silero diarization JSON files — detects language from speech segments using Whisper
+1. Finds all audio files and their corresponding Silero+Embedding diarization JSON files
+2. Saves transcripts directly in the same folder as the audio/diarization files
+3. Generates transcripts using existing diarization with Whisper for transcription
 
 Language detection uses Whisper per-channel:
-- Whisper Native: Detects from first 30 seconds of raw audio
-- Diarization methods: Detects from actual speech segments (more accurate)
+- Detects from actual speech segments identified by diarization (more accurate)
+- Falls back to detecting from raw audio if no speech segments available
 
 Note: All languages including Vietnamese ('vi') are supported by Whisper.
 
 Usage:
     python3 main_transcript_comparison.py /path/to/parent/folder
-    python3 main_transcript_comparison.py /path/to/parent --methods whisper webrtc silero
     python3 main_transcript_comparison.py /path/to/parent --language en
     python3 main_transcript_comparison.py /path/to/parent --verbose
 """
@@ -55,25 +51,17 @@ def find_subfolders(parent_path: Path) -> List[Path]:
     return sorted(subfolders)
 
 
-def find_diarization_file(audio_file: Path, method: str) -> Optional[Path]:
+def find_diarization_file(audio_file: Path) -> Optional[Path]:
     """
-    Find the corresponding diarization JSON file for an audio file.
+    Find the corresponding Silero+Embedding diarization JSON file for an audio file.
     
-    Expected naming patterns:
+    Expected naming pattern:
     - Audio: filename.wav
-    - WebRTC: filename_diarization_webrtc_vad.json
-    - Silero: filename_diarization_silero_vad.json
+    - Diarization: filename_multichannel_audio_diarization.json
     """
     audio_stem = audio_file.stem
+    pattern = f"{audio_stem}*diarization*.json"
     
-    if method == 'webrtc':
-        pattern = f"{audio_stem}*webrtc*.json"
-    elif method == 'silero':
-        pattern = f"{audio_stem}*silero*.json"
-    else:
-        return None
-    
-    # Search in the same directory as the audio file
     for file in audio_file.parent.glob(pattern):
         return file
     
@@ -134,49 +122,16 @@ def convert_numpy_types(obj):
     return obj
 
 
-def generate_transcript_whisper_native(audio_file_path: str, language_hint: str = None, verbose: bool = False) -> Dict[str, Any]:
+def generate_transcript_with_diarization(audio_file_path: str,
+                                         diarization_file: Path,
+                                         language_hint: str = None,
+                                         verbose: bool = False) -> Dict[str, Any]:
     """
-    Generate transcript using Whisper's native diarization.
-    Language detection uses SpeechBrain on raw audio (no diarization available yet).
-    """
-    try:
-        print(f"      [WHISPER NATIVE] Generating transcript...")
-        
-        # No diarization data for Whisper native - detects from raw audio
-        generator = MultichannelTranscriptGenerator(
-            audio_file_path, 
-            language_hint=language_hint,
-            diarization_data=None  # Will detect from raw audio
-        )
-        transcript = generator.transcribe_with_whisper_native()
-        
-        print(f"        ✓ Generated {transcript.get('num_segments', 0)} segments")
-        
-        return transcript
-        
-    except Exception as e:
-        if verbose:
-            import traceback
-            traceback.print_exc()
-        return {"error": str(e), "transcription_mode": "whisper_native"}
-
-
-def generate_transcript_with_existing_diarization(audio_file_path: str,
-                                                  diarization_file: Path,
-                                                  method: str,
-                                                  language_hint: str = None,
-                                                  verbose: bool = False) -> Dict[str, Any]:
-    """
-    Generate transcript using existing diarization JSON file.
-    Language detection uses SpeechBrain on actual speech segments (more accurate).
+    Generate transcript using existing Silero+Embedding diarization JSON file.
+    Language detection uses Whisper on actual speech segments (more accurate).
     """
     try:
-        method_names = {
-            'webrtc': 'WebRTC VAD',
-            'silero': 'Silero VAD'
-        }
-        
-        print(f"      [{method.upper()}] Loading existing diarization: {diarization_file.name}")
+        print(f"      Loading existing diarization: {diarization_file.name}")
         
         diarization_data = load_diarization_json(diarization_file)
         
@@ -184,21 +139,21 @@ def generate_transcript_with_existing_diarization(audio_file_path: str,
             return {
                 "error": f"Failed to load diarization file: {diarization_file}",
                 "transcription_mode": "custom_diarization",
-                "diarization_method": method
+                "diarization_method": "silero_embedding"
             }
         
-        print(f"      [{method.upper()}] Transcribing with {method_names[method]} diarization...")
+        print(f"      Transcribing with Silero+Embedding diarization...")
         
-        # Pass diarization data so language detection uses actual speech segments
+        # Pass diarization data so Whisper language detection uses actual speech segments
         generator = MultichannelTranscriptGenerator(
             audio_file_path, 
             language_hint=language_hint,
-            diarization_data=diarization_data  # Will detect from speech segments
+            diarization_data=diarization_data
         )
         transcript = generator.transcribe_with_custom_diarization(diarization_data)
         
-        transcript["diarization_method"] = method
-        transcript["diarization_method_description"] = method_names[method]
+        transcript["diarization_method"] = "silero_embedding"
+        transcript["diarization_method_description"] = "Silero+Embedding VAD"
         transcript["diarization_source_file"] = str(diarization_file)
         
         print(f"        ✓ Generated {transcript.get('num_segments', 0)} segments")
@@ -212,90 +167,73 @@ def generate_transcript_with_existing_diarization(audio_file_path: str,
         return {
             "error": str(e),
             "transcription_mode": "custom_diarization",
-            "diarization_method": method
+            "diarization_method": "silero_embedding"
         }
 
 
 def process_audio_file(audio_file: Path, 
-                      output_dir: Path,
-                      methods_to_use: List[str],
                       language_hint: str = None,
                       verbose: bool = False) -> Tuple[int, int]:
     """
-    Process a single audio file with all selected transcription methods.
+    Process a single audio file with Silero+Embedding diarization transcription.
+    Saves transcript in the same folder as the audio file.
     """
     print(f"    Processing: {audio_file.name}")
+    
+    output_dir = audio_file.parent
     
     try:
         info = sf.info(str(audio_file))
         print(f"      Channels: {info.channels}, Sample Rate: {info.samplerate} Hz, Duration: {info.duration:.2f}s")
     except Exception as e:
         print(f"      ✗ Error reading audio metadata: {e}")
-        return 0, len(methods_to_use)
+        return 0, 1
     
-    success_count = 0
-    error_count = 0
+    # Find existing diarization file
+    diarization_file = find_diarization_file(audio_file)
     
-    for method in methods_to_use:
-        try:
-            if method == 'whisper':
-                transcript = generate_transcript_whisper_native(
-                    str(audio_file),
-                    language_hint=language_hint,
-                    verbose=verbose
-                )
-                output_suffix = "whisper_native"
-            else:
-                # Find existing diarization file
-                diarization_file = find_diarization_file(audio_file, method)
-                
-                if not diarization_file:
-                    print(f"      ✗ No {method.upper()} diarization file found for {audio_file.name}")
-                    error_count += 1
-                    continue
-                
-                transcript = generate_transcript_with_existing_diarization(
-                    str(audio_file),
-                    diarization_file=diarization_file,
-                    method=method,
-                    language_hint=language_hint,
-                    verbose=verbose
-                )
-                output_suffix = f"{method}_diarization"
-            
-            transcript = convert_numpy_types(transcript)
-            
-            transcript['audio_file'] = str(audio_file)
-            transcript['audio_metadata'] = {
-                'num_channels': info.channels,
-                'sample_rate_hz': info.samplerate,
-                'duration_sec': round(info.duration, 3),
-                'bit_depth': info.subtype
-            }
-            
-            output_json_path = output_dir / f"{audio_file.stem}_transcript_{output_suffix}.json"
-            with open(output_json_path, 'w', encoding='utf-8') as f:
-                json.dump(transcript, f, indent=2, ensure_ascii=False)
-            
-            if "error" in transcript:
-                print(f"        ✗ Error: {transcript['error']}")
-                error_count += 1
-            else:
-                print(f"        ✓ Saved: {output_json_path.name}")
-                success_count += 1
-                
-        except Exception as e:
-            print(f"      ✗ Error with {method}: {e}")
-            if verbose:
-                import traceback
-                traceback.print_exc()
-            error_count += 1
+    if not diarization_file:
+        print(f"      ✗ No Silero+Embedding diarization file found for {audio_file.name}")
+        return 0, 1
     
-    return success_count, error_count
+    try:
+        transcript = generate_transcript_with_diarization(
+            str(audio_file),
+            diarization_file=diarization_file,
+            language_hint=language_hint,
+            verbose=verbose
+        )
+        
+        transcript = convert_numpy_types(transcript)
+        
+        transcript['audio_file'] = str(audio_file)
+        transcript['audio_metadata'] = {
+            'num_channels': info.channels,
+            'sample_rate_hz': info.samplerate,
+            'duration_sec': round(info.duration, 3),
+            'bit_depth': info.subtype
+        }
+        
+        output_json_path = output_dir / f"{audio_file.stem}_transcript_silero_diarization.json"
+        with open(output_json_path, 'w', encoding='utf-8') as f:
+            json.dump(transcript, f, indent=2, ensure_ascii=False)
+        
+        if "error" in transcript:
+            print(f"        ✗ Error: {transcript['error']}")
+            return 0, 1
+        else:
+            print(f"        ✓ Saved: {output_json_path.name}")
+            return 1, 0
+            
+    except Exception as e:
+        print(f"      ✗ Error: {e}")
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        return 0, 1
 
 
 def process_subfolder(subfolder: Path,
-                     methods_to_use: List[str],
                      language_hint: str = None,
                      verbose: bool = False) -> Tuple[int, int, int]:
     audio_files = find_audio_files(subfolder)
@@ -305,10 +243,7 @@ def process_subfolder(subfolder: Path,
         return 0, 0, 0
     
     print(f"  Found {len(audio_files)} audio file(s)")
-    
-    transcripts_dir = subfolder / f"{subfolder.name}_transcripts"
-    transcripts_dir.mkdir(exist_ok=True)
-    print(f"  Output directory: {transcripts_dir.name}/")
+    print(f"  Output: transcripts saved alongside audio files")
     
     total_success = 0
     total_errors = 0
@@ -317,8 +252,6 @@ def process_subfolder(subfolder: Path,
         print(f"\n  [{i}/{len(audio_files)}]")
         success, errors = process_audio_file(
             audio_file,
-            transcripts_dir,
-            methods_to_use,
             language_hint,
             verbose
         )
@@ -330,16 +263,13 @@ def process_subfolder(subfolder: Path,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate transcripts using Whisper native and existing diarization JSON files"
+        description="Generate transcripts using Whisper with existing Silero+Embedding diarization JSON files"
     )
     parser.add_argument("parent_path", type=str,
                        help="Path to parent folder containing subfolders with audio files")
-    parser.add_argument("--methods", nargs='+',
-                       choices=['whisper', 'webrtc', 'silero', 'all'],
-                       default=['all'],
-                       help="Transcription methods to use (default: all)")
     parser.add_argument("--language", type=str, default=None,
-                       help="Language hint for transcription (e.g., 'en', 'es', 'en-US')")
+                       help="Language hint for transcription (e.g., 'en', 'es', 'en-US'). "
+                            "If not provided, Whisper auto-detects per channel from speech segments.")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose logging")
     
@@ -347,12 +277,6 @@ def main():
     
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
-    
-    # Only whisper, webrtc, silero are active methods
-    if 'all' in args.methods:
-        methods_to_use = ['whisper', 'webrtc', 'silero']
-    else:
-        methods_to_use = args.methods
     
     parent_path = Path(args.parent_path)
     if not parent_path.exists():
@@ -372,32 +296,28 @@ def main():
         print(f"  {parent_path}/")
         print(f"    ├── subfolder1/")
         print(f"    │   ├── audio.wav")
-        print(f"    │   ├── audio_diarization_webrtc_vad.json")
         print(f"    │   └── audio_diarization_silero_vad.json")
         print(f"    └── subfolder2/")
         print(f"        ├── audio.wav")
-        print(f"        ├── audio_diarization_webrtc_vad.json")
         print(f"        └── audio_diarization_silero_vad.json")
         return
     
     print(f"\n{'='*80}")
-    print(f"MULTI-METHOD TRANSCRIPT COMPARISON (Using Existing Diarization Files)")
+    print(f"TRANSCRIPT GENERATION (Using Existing Silero+Embedding Diarization)")
     print(f"{'='*80}")
     print(f"Parent Folder: {parent_path.absolute()}")
     print(f"Subfolders Found: {len(subfolders)}")
-    print(f"Transcription Methods: {', '.join(methods_to_use)}")
+    print(f"Transcription: Whisper with Silero+Embedding diarization")
     if args.language:
-        print(f"Language Hint: {args.language} (overrides detection)")
+        print(f"Language: {args.language} (manual override)")
     else:
-        print(f"Language Detection: Whisper per-channel")
-        print(f"  - Whisper Native: Detects from raw audio")
-        print(f"  - Diarization methods: Detects from speech segments (using existing JSON files)")
+        print(f"Language Detection: Whisper auto-detect per channel from speech segments")
+    print(f"Output: Transcripts saved in same folder as audio/diarization files")
     print(f"{'='*80}\n")
     
     total_files = 0
     total_success = 0
     total_errors = 0
-    method_stats = {method: {'success': 0, 'error': 0} for method in methods_to_use}
     
     for idx, subfolder in enumerate(subfolders, 1):
         print(f"{'='*80}")
@@ -406,7 +326,6 @@ def main():
         
         files_processed, success, errors = process_subfolder(
             subfolder,
-            methods_to_use,
             language_hint=args.language,
             verbose=args.verbose
         )
@@ -415,13 +334,6 @@ def main():
         total_success += success
         total_errors += errors
         
-        if files_processed > 0:
-            for method in methods_to_use:
-                method_success = success // len(methods_to_use)
-                method_errors = errors // len(methods_to_use)
-                method_stats[method]['success'] += method_success
-                method_stats[method]['error'] += method_errors
-        
         print(f"\n  Subfolder Summary:")
         print(f"    Files processed: {files_processed}")
         print(f"    Transcripts generated: {success}")
@@ -429,37 +341,25 @@ def main():
         print()
     
     print(f"{'='*80}")
-    print("TRANSCRIPT COMPARISON SUMMARY")
+    print("TRANSCRIPT GENERATION SUMMARY")
     print(f"{'='*80}")
     print(f"Total subfolders processed: {len(subfolders)}")
     print(f"Total audio files: {total_files}")
     print(f"Total transcripts generated: {total_success}")
     print(f"Total errors: {total_errors}")
     
-    print(f"\nMethod Statistics (approximate):")
-    for method in methods_to_use:
-        stats = method_stats[method]
-        total = stats['success'] + stats['error']
-        success_rate = (stats['success'] / total * 100) if total > 0 else 0
-        method_label = "Whisper Native" if method == 'whisper' else f"{method.upper()} Diarization"
-        print(f"  {method_label:20s}: {stats['success']}/{total} successful ({success_rate:.1f}%)")
+    if total_files > 0:
+        success_rate = (total_success / total_files * 100)
+        print(f"Success rate: {total_success}/{total_files} ({success_rate:.1f}%)")
     
     if total_success > 0:
         print(f"\n✓ Transcript generation completed!")
         print(f"\nGenerated files per audio file:")
-        if 'whisper' in methods_to_use:
-            print(f"  - *_transcript_whisper_native.json")
-        if 'webrtc' in methods_to_use:
-            print(f"  - *_transcript_webrtc_diarization.json")
-        if 'silero' in methods_to_use:
-            print(f"  - *_transcript_silero_diarization.json")
-        
+        print(f"  - *_transcript_silero_diarization.json")
         print(f"\nOutput location:")
-        print(f"  Each subfolder contains a '<subfolder_name>_transcripts/' directory")
+        print(f"  Transcripts saved alongside audio and diarization files in each subfolder")
         print(f"\nLanguage detection:")
-        print(f"  - Whisper per-channel language identification")
-        print(f"  - Whisper Native: Detects from raw audio (first 30s)")
-        print(f"  - WebRTC/Silero: Detects from speech segments in existing diarization files")
+        print(f"  - Whisper per-channel language identification from speech segments")
         print(f"  - All languages including Vietnamese ('vi') are supported")
     
     print(f"{'='*80}\n")
